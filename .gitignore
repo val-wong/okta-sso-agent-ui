@@ -16,3 +16,4 @@ tf-import.log
 
 # Generated TF (keep an example elsewhere if needed)
 backend/terraform/generated/
+idp_cert.pem
