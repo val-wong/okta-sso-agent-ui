@@ -1,0 +1,18 @@
+# Terraform
+**/.terraform/
+**/*.tfstate*
+**/.terraform.tfstate.lock.info
+**/crash.log
+!.terraform.lock.hcl
+
+# Local env & logs
+.env
+.envrc
+*.tfvars*
+*.tfvars.json
+okta_env.sh
+tf-import.log
+*.log
+
+# Generated TF (keep an example elsewhere if needed)
+backend/terraform/generated/

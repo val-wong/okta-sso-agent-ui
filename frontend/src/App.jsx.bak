@@ -1,0 +1,326 @@
+cd ~/okta-sso-agent-ui
+cp frontend/src/App.jsx frontend/src/App.jsx.bak
+
+# overwrite App.jsx with the new generic UI
+cat > frontend/src/App.jsx <<'EOF'
+import React, { useEffect, useMemo, useState } from 'react'
+import { apiGet, apiPost, API_BASE, downloadText } from './api'
+
+const TEMPLATES = [
+  { value: 'saml_only', label: 'SAML Only' },
+  { value: 'generic_scim', label: 'Generic SCIM' },
+  { value: 'zoom', label: 'Zoom (SAML + SCIM)' },
+]
+
+export default function App() {
+  const [health, setHealth] = useState(null)
+  const [config, setConfig] = useState(null)
+
+  const [apps, setApps] = useState([])
+  const [loadingApps, setLoadingApps] = useState(false)
+
+  const [error, setError] = useState(null)
+  const [notice, setNotice] = useState(null)
+
+  const [tpl, setTpl] = useState('saml_only')
+  const [form, setForm] = useState({
+    app_label: 'Okta App',
+    zoom_account_id: '',
+    sso_acs_url: '',
+    sso_entity_id: '',
+    idp_x509_cert: '',
+    scim_base_url: '',
+    scim_bearer_token: ''
+  })
+  const [tfResult, setTfResult] = useState(null)
+  const [savePath, setSavePath] = useState(null)
+  const [generating, setGenerating] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const [detailsId, setDetailsId] = useState(null)
+  const [detailsData, setDetailsData] = useState(null)
+  const [detailsLoading, setDetailsLoading] = useState(false)
+
+  const [q, setQ] = useState('')
+  const [qLive, setQLive] = useState('')
+  const [onlyScim, setOnlyScim] = useState(false)
+  const [onlyProv, setOnlyProv] = useState(false)
+
+  useEffect(() => {
+    apiGet('/health').then(setHealth).catch(() => {})
+    apiGet('/config').then(setConfig).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    const t = setTimeout(() => setQ(qLive.trim().toLowerCase()), 250)
+    return () => clearTimeout(t)
+  }, [qLive])
+
+  async function loadApps() {
+    try {
+      setError(null); setNotice(null); setLoadingApps(true)
+      const data = await apiGet('/apps/scan', { limit: 200 })
+      setApps(data.apps || [])
+      setNotice(`Loaded ${data.count || (data.apps || []).length} apps`)
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setLoadingApps(false)
+    }
+  }
+
+  async function openDetails(id) {
+    try {
+      setDetailsData(null); setDetailsLoading(true); setDetailsId(id)
+      const d = await apiGet(`/apps/${id}`)
+      setDetailsData(d)
+    } catch (e) {
+      setError(String(e.message || e)); setDetailsId(null)
+    } finally {
+      setDetailsLoading(false)
+    }
+  }
+  function closeDetails() { setDetailsId(null); setDetailsData(null) }
+
+  function useApp(app) {
+    setForm(s => ({ ...s, app_label: app?.label ? `${app.label}` : 'Okta App' }))
+    setNotice(`Using "${app.label}" as label`)
+  }
+
+  async function generateTf() {
+    setError(null); setNotice(null); setTfResult(null); setSavePath(null); setGenerating(true)
+    try {
+      const payload = { template: tpl, ...form }
+      const res = await apiPost('/tf/generate', payload)
+      setTfResult(res); setNotice(`Generated ${res.filename}`)
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  async function saveTf() {
+    if (!tfResult?.filename || !tfResult?.content) return
+    setSaving(true); setError(null); setNotice(null)
+    try {
+      const r = await apiPost('/files/tf', { filename: tfResult.filename, content: tfResult.content })
+      setSavePath(r.path); setNotice(`Saved to ${r.path}`)
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function downloadTf() {
+    if (!tfResult?.filename || !tfResult?.content) return
+    downloadText(tfResult.filename, tfResult.content)
+  }
+
+  const filteredApps = useMemo(() => {
+    let rows = apps
+    if (q) rows = rows.filter(a => (a.label || '').toLowerCase().includes(q) || (a.name || '').toLowerCase().includes(q))
+    if (onlyScim) rows = rows.filter(a => a.inferred_scim)
+    if (onlyProv) rows = rows.filter(a => a.inferred_provisioning)
+    return rows
+  }, [apps, q, onlyScim, onlyProv])
+
+  const inferredCounts = useMemo(() => {
+    const scim = apps.filter(a => a.inferred_scim).length
+    const prov = apps.filter(a => a.inferred_provisioning).length
+    return { scim, prov, total: apps.length }
+  }, [apps])
+
+  const needSaml = tpl === 'saml_only' || tpl === 'zoom'
+  const needScim = tpl === 'generic_scim' || tpl === 'zoom'
+  const needZoom = tpl === 'zoom'
+
+  return (
+    <div style={wrap}>
+      <h1>Okta SSO Agent UI</h1>
+      <p><b>API:</b> {API_BASE}</p>
+
+      {!!error && <Banner color="#d10">{error}</Banner>}
+      {!!notice && <Banner color="#0a7d2b">{notice}</Banner>}
+
+      <section style={card}>
+        <h2 style={h2}>Status</h2>
+        <Row>
+          <Stat label="Health" value={health ? 'ok' : 'checking…'} />
+          <Stat label="Org URL" value={config ? (config.org_url || '—') : 'loading…'} />
+          <Stat label="Token" value={config ? (config.has_token ? 'present' : 'missing') : 'loading…'} />
+        </Row>
+      </section>
+
+      <section style={card}>
+        <h2 style={h2}>Scan Okta Apps</h2>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <button onClick={loadApps} disabled={loadingApps} style={btn}>
+            {loadingApps ? 'Scanning…' : 'Scan /apps'}
+          </button>
+          <input placeholder="Search label or name…" value={qLive} onChange={e => setQLive(e.target.value)} style={input} />
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="checkbox" checked={onlyScim} onChange={e => setOnlyScim(e.target.checked)} /> SCIM only
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="checkbox" checked={onlyProv} onChange={e => setOnlyProv(e.target.checked)} /> Provisioning only
+          </label>
+        </div>
+
+        {!!apps.length && (
+          <>
+            <div style={{ marginTop: 12 }}>
+              Found <b>{inferredCounts.total}</b> apps · Inferred SCIM: <b>{inferredCounts.scim}</b> · Provisioning features: <b>{inferredCounts.prov}</b>
+              {q && <> · Filtered: <b>{filteredApps.length}</b></>}
+            </div>
+            <div style={{ overflow: 'auto', marginTop: 8, border: '1px solid #eee', borderRadius: 8 }}>
+              <table style={table}>
+                <thead>
+                  <tr>
+                    <th style={th}>Label</th>
+                    <th style={th}>Name</th>
+                    <th style={th}>Mode</th>
+                    <th style={th}>Status</th>
+                    <th style={th}>SCIM?</th>
+                    <th style={th}>Prov?</th>
+                    <th style={th}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredApps.map(a => (
+                    <tr key={a.id}>
+                      <td style={td}>{a.label}</td>
+                      <td style={td}>{a.name}</td>
+                      <td style={td}>{a.signOnMode}</td>
+                      <td style={td}>{a.status}</td>
+                      <td style={td}>{a.inferred_scim ? 'Yes' : 'No'}</td>
+                      <td style={td}>{a.inferred_provisioning ? 'Yes' : 'No'}</td>
+                      <td style={td}>
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <button style={linkBtn} onClick={() => openDetails(a.id)}>Details</button>
+                          <button style={btn} onClick={() => useApp(a)}>Use</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </section>
+
+      <section style={card}>
+        <h2 style={h2}>Generate Terraform</h2>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
+          <label>Template</label>
+          <select value={tpl} onChange={e => setTpl(e.target.value)} style={input}>
+            {TEMPLATES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+          </select>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <Input label="App Label" value={form.app_label} onChange={v => setForm(s => ({ ...s, app_label: v }))} />
+
+          {needZoom && (
+            <Input label="Zoom Account ID (RelayState)" value={form.zoom_account_id} onChange={v => setForm(s => ({ ...s, zoom_account_id: v }))} />
+          )}
+
+          {needSaml && (
+            <>
+              <Input label="SAML ACS URL" value={form.sso_acs_url} onChange={v => setForm(s => ({ ...s, sso_acs_url: v }))} />
+              <Input label="SAML Entity ID" value={form.sso_entity_id} onChange={v => setForm(s => ({ ...s, sso_entity_id: v }))} />
+              <Input label="IdP X509 Cert" value={form.idp_x509_cert} onChange={v => setForm(s => ({ ...s, idp_x509_cert: v }))} />
+            </>
+          )}
+
+          {needScim && (
+            <>
+              <Input label="SCIM Base URL" value={form.scim_base_url} onChange={v => setForm(s => ({ ...s, scim_base_url: v }))} />
+              <Input label="SCIM Bearer Token" value={form.scim_bearer_token} onChange={v => setForm(s => ({ ...s, scim_bearer_token: v }))} />
+            </>
+          )}
+        </div>
+
+        <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button onClick={generateTf} style={btn} disabled={generating}>{generating ? 'Generating…' : 'Generate'}</button>
+          <button onClick={saveTf} style={btn} disabled={!tfResult || saving}>{saving ? 'Saving…' : 'Save .tf'}</button>
+          <button onClick={downloadTf} style={btn} disabled={!tfResult}>Download .tf</button>
+        </div>
+
+        {tfResult && (
+          <div style={{ marginTop: 12 }}>
+            <div>Filename: <b>{tfResult.filename}</b></div>
+            <textarea readOnly value={tfResult.content} style={{ width: '100%', height: 320, marginTop: 8, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }} />
+            {savePath && <div style={{ marginTop: 8 }}>Saved to: <code>{savePath}</code></div>}
+          </div>
+        )}
+      </section>
+
+      {loadingApps && <Overlay>Scanning apps…</Overlay>}
+      {detailsId && (
+        <Modal onClose={closeDetails}>
+          <h3 style={{ margin: 0, marginBottom: 8 }}>App Details</h3>
+          {detailsLoading ? <div>Loading…</div> : (
+            <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12 }}>
+{JSON.stringify(detailsData, null, 2)}
+            </pre>
+          )}
+        </Modal>
+      )}
+    </div>
+  )
+}
+
+function Input({ label, value, onChange }) {
+  return (
+    <label style={{ display: 'grid', gap: 6 }}>
+      <span>{label}</span>
+      <input value={value} onChange={e => onChange(e.target.value)} style={input} />
+    </label>
+  )
+}
+
+function Banner({ children, color }) { return <div style={{ color: 'white', background: color, padding: 10, borderRadius: 8, marginBottom: 12 }}>{children}</div> }
+function Row({ children }) { return <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>{children}</div> }
+function Stat({ label, value }) { return (<div style={{ padding: 12, border: '1px solid #eee', borderRadius: 8, minWidth: 180 }}><div style={{ fontSize: 12, opacity: 0.7 }}>{label}</div><div style={{ fontWeight: 600 }}>{value}</div></div>) }
+
+function Modal({ children, onClose }) {
+  return (
+    <div style={modalBack} onClick={onClose}>
+      <div style={modalBody} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <button onClick={onClose} style={linkBtn}>Close</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function Overlay({ children }) {
+  return (
+    <div style={overlayBack}>
+      <div style={overlayBody}>{children}</div>
+    </div>
+  )
+}
+
+const wrap = { fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial', padding: 20, maxWidth: 1100, margin: '0 auto' }
+const h2 = { marginTop: 0 }
+const card = { marginBottom: 24, padding: 16, border: '1px solid #eee', borderRadius: 12, boxShadow: '0 1px 4px rgba(0,0,0,0.04)' }
+const table = { width: '100%', borderCollapse: 'collapse', fontSize: 14 }
+const th = { textAlign: 'left', borderBottom: '1px solid #ddd', padding: '8px 6px', position: 'sticky', top: 0, background: '#fafafa' }
+const td = { borderBottom: '1px solid #eee', padding: '8px 6px' }
+const btn = { padding: '8px 12px', borderRadius: 8, border: '1px solid #ccc', background: '#f6f6f6', cursor: 'pointer' }
+const linkBtn = { ...btn, background: '#fff' }
+const input = { padding: 8, border: '1px solid #ccc', borderRadius: 6, minWidth: 220 }
+
+const modalBack = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'grid', placeItems: 'center' }
+const modalBody = { background: '#fff', borderRadius: 12, padding: 16, width: 'min(900px, 92vw)', maxHeight: '84vh', overflow: 'auto' }
+
+const overlayBack = { position: 'fixed', inset: 0, background: 'rgba(255,255,255,0.6)', display: 'grid', placeItems: 'center' }
+const overlayBody = { background: '#fff', border: '1px solid #eee', borderRadius: 12, padding: '12px 16px', boxShadow: '0 2px 10px rgba(0,0,0,0.1)' }
+EOF
