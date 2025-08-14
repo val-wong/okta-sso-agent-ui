@@ -1,4 +1,3 @@
-# backend/main.py
 from pathlib import Path
 import os, re, logging
 from typing import Optional, List, Dict, Any, Literal
@@ -9,27 +8,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-# ── env ────────────────────────────────────────────────────────────────────────
 ENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(dotenv_path=ENV_PATH)
 
 OKTA_ORG_URL = os.getenv("OKTA_ORG_URL", "").rstrip("/")
 OKTA_API_TOKEN = os.getenv("OKTA_API_TOKEN", "")
+UI_ORIGIN = os.getenv("UI_ORIGIN", "")
 
 logger = logging.getLogger("uvicorn.error")
 
-# ── app & CORS ────────────────────────────────────────────────────────────────
 app = FastAPI(title="Okta SSO Agent API")
-origins = [f"http://localhost:{p}" for p in range(5173, 5180)]
+
+local_origins = [f"http://localhost:{p}" for p in range(5173, 5180)]
+extra_origins = [o.strip() for o in UI_ORIGIN.split(",") if o.strip()]
+origins = local_origins + extra_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── models ────────────────────────────────────────────────────────────────────
 class SaveFileInput(BaseModel):
     filename: str
     content: str
@@ -42,9 +43,8 @@ class GenerateTfInput(BaseModel):
     sso_acs_url: Optional[str] = None
     sso_entity_id: Optional[str] = None
     idp_x509_cert: Optional[str] = None
-    zoom_account_id: Optional[str] = None  # optional relay state
+    zoom_account_id: Optional[str] = None
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 def _assert_okta_config():
     if not OKTA_ORG_URL or not OKTA_API_TOKEN:
         raise HTTPException(500, detail="OKTA_ORG_URL or OKTA_API_TOKEN not set")
@@ -90,9 +90,7 @@ def _tf_header() -> str:
 def _sanitize(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", s).lower()
 
-def _tf_saml(label: str, acs: str, entity: str, pem_cert: str, *,
-             nameid_email: bool, relay_state: Optional[str], res_name: str) -> str:
-    # Correct brace count (double) and formats
+def _tf_saml(label: str, acs: str, entity: str, pem_cert: str, *, nameid_email: bool, relay_state: Optional[str], res_name: str) -> str:
     if nameid_email:
         nameid_tpl = "{{user.email}}"
         nameid_fmt = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
@@ -105,7 +103,6 @@ def _tf_saml(label: str, acs: str, entity: str, pem_cert: str, *,
 PEM"""
     rs = relay_state or ""
 
-    # v5.x: attribute_statements must be blocks, not a map
     return f'''
 resource "okta_app_saml" "{res_name}" {{
   label                    = "{label}"
@@ -145,10 +142,13 @@ resource "okta_app_saml" "{res_name}" {{
 }}
 '''.strip()
 
-# ── routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"message": "Okta SSO Agent up"}
 
 @app.get("/config")
 async def get_config():
@@ -156,6 +156,7 @@ async def get_config():
     raw_env = {
         "OKTA_ORG_URL": OKTA_ORG_URL,
         "OKTA_API_TOKEN_present": bool(OKTA_API_TOKEN),
+        "UI_ORIGIN": UI_ORIGIN,
         "env_path": str(ENV_PATH),
     }
     return {
@@ -163,7 +164,7 @@ async def get_config():
         "used_org_url": masked,
         "has_token": bool(OKTA_API_TOKEN),
         "raw_env": raw_env,
-        "cors": [f"http://localhost:{p}" for p in range(5173, 5180)],
+        "cors": origins,
     }
 
 @app.get("/apps/scan")
@@ -178,7 +179,6 @@ async def scan_apps(limit: int = 200):
                 params["after"] = after
             r = await _okta_get(client, "/api/v1/apps", params=params)
             items = r.json()
-            # summarize
             for x in items:
                 features = x.get("features") or []
                 has_prov = any(f in features for f in [
@@ -246,14 +246,12 @@ async def get_saml_cert(id: str):
 
 @app.post("/tf/generate")
 async def tf_generate(payload: GenerateTfInput):
-    # Only SAML-only flows here
     if payload.template in ("saml_only", "zoom_saml_only"):
         if not payload.app_label:
             raise HTTPException(400, detail="Missing app_label")
         if not payload.idp_x509_cert:
             raise HTTPException(400, detail="Missing idp_x509_cert")
 
-        # Zoom specifics enforced here
         if payload.template == "zoom_saml_only":
             if not payload.sso_acs_url:
                 payload.sso_acs_url = "https://zoom.us/saml/SSO"
@@ -268,7 +266,6 @@ async def tf_generate(payload: GenerateTfInput):
             if not getattr(payload, f):
                 raise HTTPException(400, detail=f"Missing {f}")
 
-        # Guard against audience accidentally being an Okta app ID
         if re.match(r"^0o[a-zA-Z0-9]+$", payload.sso_entity_id):
             if payload.template == "zoom_saml_only":
                 payload.sso_entity_id = "https://zoom.us"
@@ -302,7 +299,6 @@ async def save_tf_file(input: SaveFileInput = Body(...)):
     target.write_text(input.content, encoding="utf-8")
     return {"saved": True, "path": str(target)}
 
-# Back-compat for older UI
 @app.post("/tf/zoom")
 async def tf_zoom_bridge(payload: GenerateTfInput):
     payload.template = "zoom_saml_only"
